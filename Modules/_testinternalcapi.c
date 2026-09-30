@@ -13,6 +13,7 @@
 #include <string.h>
 #include "pycore_backoff.h"       // JUMP_BACKWARD_INITIAL_VALUE
 #include "pycore_bitutils.h"      // _Py_bswap32()
+#include "pycore_brc.h"           // _Py_brc_take_ownership()
 #include "pycore_bytesobject.h"   // _PyBytes_Find()
 #include "pycore_ceval.h"         // _PyEval_AddPendingCall()
 #include "pycore_code.h"          // _PyCode_GetTLBCFast()
@@ -2767,6 +2768,115 @@ reset_rare_event_counters(PyObject *self, PyObject *Py_UNUSED(type))
 }
 
 
+static PyObject *
+take_ownership(PyObject *self, PyObject *args, PyObject *kwargs)
+{
+    static char *kwlist[] = {"objects", "timeout", "summary", NULL};
+    PyObject *list;
+    double timeout = 5.0;
+    int summary = 0;
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O!|dp:take_ownership",
+                                     kwlist, &PyList_Type, &list, &timeout,
+                                     &summary)) {
+        return NULL;
+    }
+#ifndef Py_GIL_DISABLED
+    PyErr_SetString(PyExc_NotImplementedError,
+                    "take_ownership() requires the free-threaded build");
+    return NULL;
+#else
+    static const char *const names[] = {
+        [_Py_OWNERSHIP_ALREADY_OWNED] = "already-owned",
+        [_Py_OWNERSHIP_TRANSFERRED] = "transferred",
+        [_Py_OWNERSHIP_IMMORTAL] = "immortal",
+        [_Py_OWNERSHIP_MERGED] = "merged",
+        [_Py_OWNERSHIP_TIMEOUT] = "timeout",
+        [_Py_OWNERSHIP_CHANGED] = "changed",
+    };
+    if (!(timeout >= 0 && timeout <= 1e9)) {
+        PyErr_SetString(PyExc_ValueError, "timeout out of range");
+        return NULL;
+    }
+    // The tuple holds a strong reference to every object for the whole call.
+    PyObject *items = PySequence_Tuple(list);
+    if (items == NULL) {
+        return NULL;
+    }
+    Py_ssize_t n = PyTuple_GET_SIZE(items);
+    int *results = PyMem_Malloc((n ? n : 1) * sizeof(int));
+    if (results == NULL) {
+        Py_DECREF(items);
+        return PyErr_NoMemory();
+    }
+    PyObject *res = NULL;
+    int established = _Py_brc_take_ownership(&PyTuple_GET_ITEM(items, 0), n,
+                                             (PyTime_t)(timeout * 1e9),
+                                             results);
+    if (established < 0) {
+        goto done;
+    }
+    res = PyList_New(n);
+    if (res == NULL) {
+        goto done;
+    }
+    for (Py_ssize_t i = 0; i < n; i++) {
+        PyObject *name = PyUnicode_FromString(names[results[i]]);
+        if (name == NULL) {
+            Py_CLEAR(res);
+            goto done;
+        }
+        PyList_SET_ITEM(res, i, name);
+    }
+    if (summary) {
+        // (established, statuses); "N" consumes `res`, also on failure.
+        res = Py_BuildValue("(ON)", established ? Py_True : Py_False, res);
+    }
+done:
+    PyMem_Free(results);
+    Py_DECREF(items);
+    return res;
+#endif
+}
+
+static PyObject *
+refcount_state(PyObject *self, PyObject *obj)
+{
+#ifndef Py_GIL_DISABLED
+    PyErr_SetString(PyExc_NotImplementedError,
+                    "refcount_state() requires the free-threaded build");
+    return NULL;
+#else
+    uintptr_t tid = _Py_atomic_load_uintptr_relaxed(&obj->ob_tid);
+    uint32_t local = _Py_atomic_load_uint32_relaxed(&obj->ob_ref_local);
+    Py_ssize_t shared = _Py_atomic_load_ssize_relaxed(&obj->ob_ref_shared);
+    return Py_BuildValue(
+        "{sOsKsksnsnsO}",
+        "owned_by_current_thread", tid == _Py_ThreadId() ? Py_True : Py_False,
+        "ob_tid", (unsigned long long)tid,
+        "local", (unsigned long)local,
+        "shared_count",
+        Py_ARITHMETIC_RIGHT_SHIFT(Py_ssize_t, shared, _Py_REF_SHARED_SHIFT),
+        "shared_flags", shared & _Py_REF_SHARED_FLAG_MASK,
+        "is_immortal", _Py_IsImmortal(obj) ? Py_True : Py_False);
+#endif
+}
+
+// Busy-wait for `seconds` while attached, without reaching a safe point.
+static PyObject *
+spin_without_safe_point(PyObject *self, PyObject *arg)
+{
+    double seconds = PyFloat_AsDouble(arg);
+    if (seconds == -1 && PyErr_Occurred()) {
+        return NULL;
+    }
+    PyTime_t start, now;
+    (void)PyTime_MonotonicRaw(&start);
+    do {
+        (void)PyTime_MonotonicRaw(&now);
+    } while ((double)(now - start) < seconds * 1e9);
+    Py_RETURN_NONE;
+}
+
 #ifdef Py_GIL_DISABLED
 static PyObject *
 get_py_thread_id(PyObject *self, PyObject *Py_UNUSED(ignored))
@@ -3352,6 +3462,10 @@ static PyMethodDef module_functions[] = {
     {"type_assign_specific_version_unsafe", type_assign_specific_version_unsafe, METH_VARARGS,
      PyDoc_STR("forcefully assign type->tp_version_tag")},
 
+    {"take_ownership", _PyCFunction_CAST(take_ownership),
+     METH_VARARGS | METH_KEYWORDS},
+    {"refcount_state", refcount_state, METH_O},
+    {"spin_without_safe_point", spin_without_safe_point, METH_O},
 #ifdef Py_GIL_DISABLED
     {"py_thread_id", get_py_thread_id, METH_NOARGS},
     {"get_tlbc", get_tlbc, METH_O, NULL},
