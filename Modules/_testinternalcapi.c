@@ -13,7 +13,7 @@
 #include <string.h>
 #include "pycore_backoff.h"       // JUMP_BACKWARD_INITIAL_VALUE
 #include "pycore_bitutils.h"      // _Py_bswap32()
-#include "pycore_brc.h"           // _Py_brc_take_ownership()
+#include "pycore_brc.h"           // _Py_brc_make_shared()
 #include "pycore_bytesobject.h"   // _PyBytes_Find()
 #include "pycore_ceval.h"         // _PyEval_AddPendingCall()
 #include "pycore_code.h"          // _PyCode_GetTLBCFast()
@@ -2769,29 +2769,27 @@ reset_rare_event_counters(PyObject *self, PyObject *Py_UNUSED(type))
 
 
 static PyObject *
-take_ownership(PyObject *self, PyObject *args, PyObject *kwargs)
+make_shared(PyObject *self, PyObject *args, PyObject *kwargs)
 {
     static char *kwlist[] = {"objects", "timeout", "summary", NULL};
     PyObject *list;
     double timeout = 5.0;
     int summary = 0;
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O!|dp:take_ownership",
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "O!|dp:make_shared",
                                      kwlist, &PyList_Type, &list, &timeout,
                                      &summary)) {
         return NULL;
     }
 #ifndef Py_GIL_DISABLED
     PyErr_SetString(PyExc_NotImplementedError,
-                    "take_ownership() requires the free-threaded build");
+                    "make_shared() requires the free-threaded build");
     return NULL;
 #else
     static const char *const names[] = {
-        [_Py_OWNERSHIP_ALREADY_OWNED] = "already-owned",
-        [_Py_OWNERSHIP_TRANSFERRED] = "transferred",
-        [_Py_OWNERSHIP_IMMORTAL] = "immortal",
-        [_Py_OWNERSHIP_MERGED] = "merged",
-        [_Py_OWNERSHIP_TIMEOUT] = "timeout",
-        [_Py_OWNERSHIP_CHANGED] = "changed",
+        [_Py_SHARED_MERGED] = "shared",
+        [_Py_SHARED_IMMORTAL] = "immortal",
+        [_Py_SHARED_TIMEOUT] = "timeout",
+        [_Py_SHARED_CHANGED] = "changed",
     };
     if (!(timeout >= 0 && timeout <= 1e9)) {
         PyErr_SetString(PyExc_ValueError, "timeout out of range");
@@ -2809,10 +2807,9 @@ take_ownership(PyObject *self, PyObject *args, PyObject *kwargs)
         return PyErr_NoMemory();
     }
     PyObject *res = NULL;
-    int established = _Py_brc_take_ownership(&PyTuple_GET_ITEM(items, 0), n,
-                                             (PyTime_t)(timeout * 1e9),
-                                             results);
-    if (established < 0) {
+    int all_shared = _Py_brc_make_shared(&PyTuple_GET_ITEM(items, 0), n,
+                                         (PyTime_t)(timeout * 1e9), results);
+    if (all_shared < 0) {
         goto done;
     }
     res = PyList_New(n);
@@ -2828,8 +2825,8 @@ take_ownership(PyObject *self, PyObject *args, PyObject *kwargs)
         PyList_SET_ITEM(res, i, name);
     }
     if (summary) {
-        // (established, statuses); "N" consumes `res`, also on failure.
-        res = Py_BuildValue("(ON)", established ? Py_True : Py_False, res);
+        // (all_shared, statuses); "N" consumes `res`, also on failure.
+        res = Py_BuildValue("(ON)", all_shared ? Py_True : Py_False, res);
     }
 done:
     PyMem_Free(results);
@@ -3462,7 +3459,7 @@ static PyMethodDef module_functions[] = {
     {"type_assign_specific_version_unsafe", type_assign_specific_version_unsafe, METH_VARARGS,
      PyDoc_STR("forcefully assign type->tp_version_tag")},
 
-    {"take_ownership", _PyCFunction_CAST(take_ownership),
+    {"make_shared", _PyCFunction_CAST(make_shared),
      METH_VARARGS | METH_KEYWORDS},
     {"refcount_state", refcount_state, METH_O},
     {"spin_without_safe_point", spin_without_safe_point, METH_O},
